@@ -6,8 +6,6 @@ import torch.nn.functional as F
 from constants import PRETRAIN_MODEL_PATH
 import matplotlib.pyplot as plt
 import json
-import functools
-
 
 train_loader, test_loader = get_mnist_loaders(64)
 model = SimpleModel()
@@ -75,28 +73,36 @@ def single_obd_pruning_step():
     xbatch = train_loader.dataset.data[random_indices].float()
     ybatch = train_loader.dataset.targets[random_indices].float()
 
-    rademacher_zs = {
-        name: ((torch.rand(param.shape) < 0.5).float() * 2 - 1)
-        for name, param in model.named_parameters()
-    }  # rademacher random variables, because we need to sample from {-1, 1}
-
-    # vector-jacobian product
-    def func_model(xbatch, ybatch, params):
-        model_out = torch.func.functional_call(model, params, xbatch)
-        loss = F.cross_entropy(model_out, ybatch.to(torch.long))
-        return loss
-
-    model_grad = torch.func.grad(func_model, argnums=2)
-    # hessian-vector product is jacobian-vector product of the gradient (vjp)
-    _, grads2 = torch.func.jvp(
-        model_grad,
-        primals=(xbatch, ybatch, dict(model.named_parameters())),
-        tangents=(xbatch, ybatch, rademacher_zs),
+    # rademacher random variables, because we need to sample from {-1, 1}
+    rademacher_zs = tuple(
+        (torch.rand(param.shape) < 0.5).float() * 2 - 1 for param in model.parameters()
     )
+
+    loss = F.cross_entropy(model(xbatch), ybatch.to(torch.long))
+
+    # hessian-vector product can be computed as either jvp of the vjp
+    # or vjp(vjp(x) @ v), where  @ means a tensor dot product over the output input dimensions
+    grads = torch.autograd.grad(loss, model.parameters(), create_graph=True)
+
+    hvps = []
+
+    # Uses Pearlmutter's Algorithm
+    # d^2(L)/dxdx = vjp(vjp(L) @ v), where @ represents a tensor contraction
+    params = list(model.parameters())
+    for i in range(len(grads)):
+        # IMPORTANT -- see how we do the grad of grads[i] with respect to model.parameters()[i]
+        # that means, we are doing first the gradient of the i-th parameter with respect to the loss
+        # then the grad of contract(grads[i], rademacher_zs[i]) with respect to the i-th parameter
+        # in this case, contract corresponds to the tensor contraction of the two tensors
+        # for example, for 2 dims, res = X_ij * Y_ij (in einstein notation)
+        grad = grads[i]
+        contracted = torch.einsum("...,...->", grad, rademacher_zs[i])
+        grad2 = torch.autograd.grad(contracted, params[i], retain_graph=True)
+        hvps.append(grad2[0])
 
     # grads and rademacher are dicts BOTH WITH THE SAME KEYS
     hessian_diags = [
-        grads2[key] * rademacher_zs[key] for key, val in model.named_parameters()
+        hvp * rademacher_z for hvp, rademacher_z in zip(hvps, rademacher_zs)
     ]
 
     hessdiag = torch.cat([h.view(-1) for h in hessian_diags])

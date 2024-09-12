@@ -60,27 +60,41 @@ That is, we first pretrain and then iterate over the OBD procedure, each time ha
 
 ## PyTorch Implementation
 
-PyTorch provides a native way of computing the Hessian of the loss function with respect to the weights, but it's pretty expensive memory wise. Since we are interested only in the diagonal of the Hessian, we can approximate the diagonal of the Hessian using the following code:
+PyTorch provides a native way of computing the Hessian of the loss function with respect to the weights, but it's pretty expensive memory wise. Since we are interested only in the diagonal of the Hessian, we can approximate the diagonal of the Hessian using the Hessian-vector product as mentioned in [the AdaHessian paper](https://arxiv.org/pdf/2006.00719).
+On the other hand, Hessian-vector products are usually computed with a mix of the Jacobian-vector product and the vector-Jacobian product (forward and backward automatic differentiation), but in PyTorch, it's difficult to implement this.
+Therefore, we use Pearlmutter's trick to compute the Hessian-vector product, as mentioned in the paper [Fast Exact Multiplication by the Hessian](https://www.researchgate.net/publication/2822332_Fast_Exact_Multiplication_by_the_Hessian).
 
 ```python
 
-    # vector-jacobian product
-    def func_model(xbatch, ybatch, params):
-        model_out = torch.func.functional_call(model, params, xbatch)
-        loss = F.cross_entropy(model_out, ybatch.to(torch.long))
-        return loss
+    # rademacher random variables, because we need to sample from {-1, 1}
+    rademacher_zs = tuple((torch.rand(param.shape) < 0.5).float() * 2 - 1 for param in model.parameters())
 
-    model_grad = torch.func.grad(func_model, argnums=2)
-    # hessian-vector product is jacobian-vector product of the gradient (vjp)
-    _, grads2 = torch.func.jvp(
-        model_grad,
-        primals=(xbatch, ybatch, dict(model.named_parameters())),
-        tangents=(xbatch, ybatch, rademacher_zs),
-    )
+    loss = F.cross_entropy(model(xbatch), ybatch.to(torch.long))
+
+    # hessian-vector product can be computed as either jvp of the vjp
+    # or vjp(vjp(x) @ v), where  @ means a tensor dot product over the output input dimensions
+    grads = torch.autograd.grad(loss, model.parameters(), create_graph=True)
+
+    hvps = []
+
+    # Uses Pearlmutter's Algorithm
+    # d^2(L)/dxdx = vjp(vjp(L) @ v), where @ represents a tensor contraction
+    params = list(model.parameters())
+    for i in range(len(grads)):
+        # IMPORTANT -- see how we do the grad of grads[i] with respect to model.parameters()[i]
+        # that means, we are doing first the gradient of the i-th parameter with respect to the loss
+        # then the grad of contract(grads[i], rademacher_zs[i]) with respect to the i-th parameter
+        # in this case, contract corresponds to the tensor contraction of the two tensors
+        # for example, for 2 dims, res = X_ij * Y_ij (in einstein notation)
+        grad = grads[i]
+        contracted = torch.einsum("...,...->", grad, rademacher_zs[i])
+        grad2 = torch.autograd.grad(contracted, params[i], retain_graph=True)
+        hvps.append(grad2[0])
+
 
     # grads and rademacher are dicts BOTH WITH THE SAME KEYS
     hessian_diags = [
-        grads2[key] * rademacher_zs[key] for key, val in model.named_parameters()
+        hvp * rademacher_z for hvp, rademacher_z in zip(hvps, rademacher_zs)
     ]
 
     hessdiag = torch.cat([h.view(-1) for h in hessian_diags])
@@ -88,9 +102,6 @@ PyTorch provides a native way of computing the Hessian of the loss function with
     catted = torch.cat([param.contiguous().view(-1) for param in model.parameters()])
     saliencies = hessdiag * (catted**2) / 2
 ```
-
-This is an approximation of the Hessian diagonal, which we use to compute the saliency of each weight. The details can be found on the code.
-The approximation implementation follows the details mentioned in [the AdaHessian paper](https://arxiv.org/pdf/2006.00719).
 
 ![OBD](./images/ada_hessian_diag.png)
 
@@ -133,15 +144,22 @@ Further elimination of parameters would lead to a decrease in accuracy.
         volume = {2},
         year = {1989}
 }
-```
-
-```bibtex
 @misc{yao2021adahessian,
-      title={ADAHESSIAN: An Adaptive Second Order Optimizer for Machine Learning},
-      author={Zhewei Yao and Amir Gholami and Sheng Shen and Mustafa Mustafa and Kurt Keutzer and Michael W. Mahoney},
-      year={2021},
-      eprint={2006.00719},
-      archivePrefix={arXiv},
-      primaryClass={cs.LG}
+        title={ADAHESSIAN: An Adaptive Second Order Optimizer for Machine Learning},
+        author={Zhewei Yao and Amir Gholami and Sheng Shen and Mustafa Mustafa and Kurt Keutzer and Michael W. Mahoney},
+        year={2021},
+        eprint={2006.00719},
+        archivePrefix={arXiv},
+        primaryClass={cs.LG}
+}
+@article{article,
+        author = {Pearlmutter, Barak},
+        year = {1970},
+        month = {02},
+        pages = {},
+        title = {Fast Exact Multiplication by the Hessian},
+        volume = {6},
+        journal = {Neural Computation},
+        doi = {10.1162/neco.1994.6.1.147}
 }
 ```
