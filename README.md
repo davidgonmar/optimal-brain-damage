@@ -64,30 +64,29 @@ PyTorch provides a native way of computing the Hessian of the loss function with
 
 ```python
 
-    # df/dw (Jacobian-vector products)
-    grads = torch.autograd.grad(loss, model.parameters(), create_graph=True)
+    # vector-jacobian product
+    def func_model(xbatch, ybatch, params):
+        model_out = torch.func.functional_call(model, params, xbatch)
+        loss = F.cross_entropy(model_out, ybatch.to(torch.long))
+        return loss
 
-    rademacher_zs = [((torch.rand(g.shape) < 0.5).float() * 2 - 1) for g in grads] # rademacher random variables, because we need to sample from {-1, 1}
-
-    # Hessian-vector product
-    grads2 = torch.autograd.grad(
-        grads,
-        model.parameters(),
-        grad_outputs=rademacher_zs,
+    model_grad = torch.func.grad(func_model, argnums=2)
+    # hessian-vector product is jacobian-vector product of the gradient (vjp)
+    _, grads2 = torch.func.jvp(
+        model_grad,
+        primals=(xbatch, ybatch, dict(model.named_parameters())),
+        tangents=(xbatch, ybatch, rademacher_zs),
     )
 
-    hessian_diags = [g2 * z for g2, z in zip(grads2, rademacher_zs)]
+    # grads and rademacher are dicts BOTH WITH THE SAME KEYS
+    hessian_diags = [
+        grads2[key] * rademacher_zs[key] for key, val in model.named_parameters()
+    ]
 
     hessdiag = torch.cat([h.view(-1) for h in hessian_diags])
 
-    saliencies = (
-        hessdiag
-        * (
-            torch.cat([param.contiguous().view(-1) for param in model.parameters()])
-            ** 2
-        )
-        / 2
-    )
+    catted = torch.cat([param.contiguous().view(-1) for param in model.parameters()])
+    saliencies = hessdiag * (catted**2) / 2
 ```
 
 This is an approximation of the Hessian diagonal, which we use to compute the saliency of each weight. The details can be found on the code.

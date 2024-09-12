@@ -6,6 +6,8 @@ import torch.nn.functional as F
 from constants import PRETRAIN_MODEL_PATH
 import matplotlib.pyplot as plt
 import json
+import functools
+
 
 train_loader, test_loader = get_mnist_loaders(64)
 model = SimpleModel()
@@ -73,41 +75,40 @@ def single_obd_pruning_step():
     xbatch = train_loader.dataset.data[random_indices].float()
     ybatch = train_loader.dataset.targets[random_indices].float()
 
-    loss = F.cross_entropy(model(xbatch), ybatch.to(torch.int64))
+    rademacher_zs = {
+        name: ((torch.rand(param.shape) < 0.5).float() * 2 - 1)
+        for name, param in model.named_parameters()
+    }  # rademacher random variables, because we need to sample from {-1, 1}
 
-    # df/dw (Jacobian-vector products)
-    grads = torch.autograd.grad(loss, model.parameters(), create_graph=True)
+    # vector-jacobian product
+    def func_model(xbatch, ybatch, params):
+        model_out = torch.func.functional_call(model, params, xbatch)
+        loss = F.cross_entropy(model_out, ybatch.to(torch.long))
+        return loss
 
-    rademacher_zs = [
-        ((torch.rand(g.shape) < 0.5).float() * 2 - 1) for g in grads
-    ]  # rademacher random variables, because we need to sample from {-1, 1}
-    # Hessian-vector product
-    grads2 = torch.autograd.grad(
-        grads,
-        model.parameters(),
-        grad_outputs=rademacher_zs,
+    model_grad = torch.func.grad(func_model, argnums=2)
+    # hessian-vector product is jacobian-vector product of the gradient (vjp)
+    _, grads2 = torch.func.jvp(
+        model_grad,
+        primals=(xbatch, ybatch, dict(model.named_parameters())),
+        tangents=(xbatch, ybatch, rademacher_zs),
     )
 
-    hessian_diags = [g2 * z for g2, z in zip(grads2, rademacher_zs)]
+    # grads and rademacher are dicts BOTH WITH THE SAME KEYS
+    hessian_diags = [
+        grads2[key] * rademacher_zs[key] for key, val in model.named_parameters()
+    ]
 
     hessdiag = torch.cat([h.view(-1) for h in hessian_diags])
 
-    saliencies = (
-        hessdiag
-        * (
-            torch.cat([param.contiguous().view(-1) for param in model.parameters()])
-            ** 2
-        )
-        / 2
-    )
+    catted = torch.cat([param.contiguous().view(-1) for param in model.parameters()])
+    saliencies = hessdiag * (catted**2) / 2
 
     # we don't want to prune weights that are already zero, so for them not to be selected, we set saliency to +inf
-    saliencies[
-        torch.cat([param.contiguous().view(-1) for param in model.parameters()]) == 0
-    ] = float("inf")
+    saliencies[catted == 0] = float("inf")
 
     # get param indices with top lowest saliencies magnitude (the original paper does not mention the magnitude, but it makes sense to use it, and yields better results)
-    saliencies, indices = torch.topk(saliencies.abs(), TOP_K, largest=False)
+    indices = torch.topk(saliencies.abs(), TOP_K, largest=False)[1]
 
     # now, for each param in the index, make it 0
     for index in indices:
@@ -122,24 +123,20 @@ def single_obd_pruning_step():
                 param.data.view(-1)[param_index] = 0
                 break
 
-    # print params set to 0
-    n_params_to_0 = sum([torch.sum(param == 0).item() for param in model.parameters()])
-    print(f"Pruned {TOP_K} params, now {n_params_to_0} params are set to 0")
-
 
 # plot the losses and accuracies during OBD
 
 graph = plt.figure()
 ax = graph.add_subplot(111)
 ax.set_title("OBD")
-ax.set_xlabel("Params set to 0")
+ax.set_xlabel("Percent of weights set to 0")
 ax.set_ylabel("Accuracy")
 # make it interactive
 plt.ion()
 
 
-def update_graph(accs, n_params_to_0):
-    ax.plot(n_params_to_0, accs)
+def update_graph(accs, percent_params_to_0):
+    ax.plot(percent_params_to_0, accs)
     plt.show()
     plt.pause(0.1)
 
@@ -149,19 +146,19 @@ def obd():
     accs = []
     losses = []
     n_params_to_0 = []
+    percent_params_to_0 = []
     NUMBER_OBD_STEPS = 100
 
     for i in range(NUMBER_OBD_STEPS):
         single_obd_pruning_step()
+        total_params = sum([param.numel() for param in model.parameters()])
+        set_to_0 = sum([torch.sum(param == 0).item() for param in model.parameters()])
         print(
-            "Number of params set to 0: ",
-            sum([torch.sum(param == 0).item() for param in model.parameters()]),
+            "Number of params set to 0: {}/{} -- {:.2f}%".format(
+                set_to_0, total_params, 100.0 * set_to_0 / total_params
+            )
         )
         train_epoch()
-        print(
-            "Number of params set to 0: ",
-            sum([torch.sum(param == 0).item() for param in model.parameters()]),
-        )
         model.eval()
         test_loss = 0
         correct = 0
@@ -182,14 +179,16 @@ def obd():
         accs.append(acc)
         losses.append(test_loss)
         n_params_to_0.append(n_params_to_0_now)
+        percent_params_to_0.append(100.0 * n_params_to_0_now / total_params)
 
-        update_graph(accs, n_params_to_0)
+        update_graph(accs, percent_params_to_0)
 
         d = {
             "total_params": sum([param.numel() for param in model.parameters()]),
             "set_to_0": n_params_to_0_now,
             "accuracy": acc,
             "loss": test_loss,
+            "percent_params_to_0": 100.0 * n_params_to_0_now / total_params,
         }
 
         d_path = PRETRAIN_MODEL_PATH + "_obd_stats.jsonl"
