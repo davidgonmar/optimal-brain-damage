@@ -1,3 +1,4 @@
+import functools
 import torch
 from model import SimpleModel
 import torch.optim as optim
@@ -20,7 +21,7 @@ def pretrain():
         return
     except FileNotFoundError:
         pass
-    optimizer = optim.SGD(model.parameters(), lr=0.01, momentum=0.5)
+    optimizer = optim.Adam(model.parameters())
     # Train
     model.train()
 
@@ -67,6 +68,28 @@ def train_epoch():
     print("Trained Epoch with loss: ", avg_loss / len(train_loader.dataset))
 
 
+# the hessian vector product can be seen as jvp(vjp(f, v=1), v=v) (f is a scalar function)
+# since f is scalar, it is also equivalent to jvp(grad(f), v=v)
+def hvp(fun, args, tangents):
+    # func must have signature (x, y, model_params) -> loss, so argnum to differentiate wrt to model_params is 2
+    gradfn = torch.func.grad(fun, argnums=2)
+    nondiff_args = [
+        args[0],
+        args[1],
+    ]  # we might not want to differentiate wrt to some args (data, for example)
+    primals = (args[2],)
+    # jvp returns (out, jvp) but we only need the jvp result (the hessian vector product)
+    return torch.func.jvp(
+        functools.partial(gradfn, *nondiff_args), primals=primals, tangents=(tangents,)
+    )[1]
+
+
+def get_loss(xbatch, ybatch, params):
+    model_out = torch.func.functional_call(model, params, xbatch)
+    loss = F.cross_entropy(model_out, ybatch.to(torch.long))
+    return loss
+
+
 def single_obd_pruning_step():
     batch_size_obd = 512
     random_indices = torch.randint(0, len(train_loader.dataset), (batch_size_obd,))
@@ -74,35 +97,17 @@ def single_obd_pruning_step():
     ybatch = train_loader.dataset.targets[random_indices].float()
 
     # rademacher random variables, because we need to sample from {-1, 1}
-    rademacher_zs = tuple(
-        (torch.rand(param.shape) < 0.5).float() * 2 - 1 for param in model.parameters()
+    rademacher_zs = {
+        name: ((torch.rand(param.shape) < 0.5).float() * 2 - 1)
+        for name, param in model.named_parameters()
+    }
+
+    hvps = hvp(
+        get_loss, (xbatch, ybatch, dict(model.named_parameters())), rademacher_zs
     )
 
-    loss = F.cross_entropy(model(xbatch), ybatch.to(torch.long))
-
-    # hessian-vector product can be computed as either jvp of the vjp
-    # or vjp(vjp(x) @ v), where  @ means a tensor dot product over the output input dimensions
-    grads = torch.autograd.grad(loss, model.parameters(), create_graph=True)
-
-    hvps = []
-
-    # Uses Pearlmutter's Algorithm
-    # d^2(L)/dxdx = vjp(vjp(L) @ v), where @ represents a tensor contraction
-    params = list(model.parameters())
-    for i in range(len(grads)):
-        # IMPORTANT -- see how we do the grad of grads[i] with respect to model.parameters()[i]
-        # that means, we are doing first the gradient of the i-th parameter with respect to the loss
-        # then the grad of contract(grads[i], rademacher_zs[i]) with respect to the i-th parameter
-        # in this case, contract corresponds to the tensor contraction of the two tensors
-        # for example, for 2 dims, res = X_ij * Y_ij (in einstein notation)
-        grad = grads[i]
-        contracted = torch.einsum("...,...->", grad, rademacher_zs[i])
-        grad2 = torch.autograd.grad(contracted, params[i], retain_graph=True)
-        hvps.append(grad2[0])
-
-    # grads and rademacher are dicts BOTH WITH THE SAME KEYS
     hessian_diags = [
-        hvp * rademacher_z for hvp, rademacher_z in zip(hvps, rademacher_zs)
+        hvps[key] * rademacher_zs[key] for key, _, in model.named_parameters()
     ]
 
     hessdiag = torch.cat([h.view(-1) for h in hessian_diags])
